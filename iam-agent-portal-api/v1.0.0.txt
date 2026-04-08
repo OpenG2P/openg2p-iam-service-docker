@@ -1,0 +1,4 @@
+#!openg2p/iam-agent-portal-api:v1.0.0
+git://v1.1.6//https://github.com/openg2p/openg2p-fastapi-common#subdirectory=openg2p-fastapi-common
+git://v1.0.0//https://github.com/openg2p/openg2p-iam-service#subdirectory=iam-core
+git://v1.0.0//https://github.com/openg2p/openg2p-iam-service#subdirectory=iam-agent-portal-api
