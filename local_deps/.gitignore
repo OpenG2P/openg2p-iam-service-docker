@@ -1,0 +1,4 @@
+# Ignore everything staged here by build.sh during local builds.
+# This file itself must not be ignored so that git tracks the directory.
+*
+!.gitignore

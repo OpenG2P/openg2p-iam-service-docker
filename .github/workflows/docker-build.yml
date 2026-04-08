@@ -1,0 +1,194 @@
+name: Build & Push IAM Dockers
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build for all IAM APIs, for example 1.0 or v1.0.0"
+        required: true
+        type: string
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        shell: python
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          import json
+          import os
+
+          version = os.environ["INPUT_VERSION"].strip()
+
+          matrix = {
+              "include": [
+                  {
+                      "name": "iam-staff-portal-api",
+                      "serviceFile": f"iam-staff-portal-api/{version}.txt",
+                      "dockerfile": "iam-staff-portal-api/Dockerfile",
+                  },
+                  {
+                      "name": "iam-agent-portal-api",
+                      "serviceFile": f"iam-agent-portal-api/{version}.txt",
+                      "dockerfile": "iam-agent-portal-api/Dockerfile",
+                  },
+                  {
+                      "name": "iam-bene-portal-api",
+                      "serviceFile": f"iam-bene-portal-api/{version}.txt",
+                      "dockerfile": "iam-bene-portal-api/Dockerfile",
+                  },
+              ]
+          }
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+              handle.write(f"matrix={json.dumps(matrix)}\n")
+
+  docker-build:
+    needs: setup
+    runs-on: ubuntu-latest
+    name: Docker - ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.docker_hub_actor }}
+          password: ${{ secrets.docker_hub_token }}
+
+      - name: Diagnostics
+        shell: bash
+        run: |
+          echo "== Docker info =="
+          docker info || true
+          echo
+          echo "== Buildx version =="
+          docker buildx version || true
+          echo
+          echo "== Builder info =="
+          docker buildx ls || true
+
+      - name: Read service file and prepare adapters requirements - ${{ matrix.name }}
+        id: read
+        shell: python
+        env:
+          SERVICE_FILE: ${{ matrix.serviceFile }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: |
+          import os
+          import re
+          import subprocess
+          import sys
+          from datetime import datetime, timezone
+
+          service_file = os.environ["SERVICE_FILE"]
+          dockerfile = os.environ["DOCKERFILE"]
+
+          if not os.path.exists(service_file):
+              print(f"Service file not found: {service_file}", file=sys.stderr)
+              sys.exit(1)
+
+          if not os.path.exists(dockerfile):
+              print(f"Dockerfile not found: {dockerfile}", file=sys.stderr)
+              sys.exit(1)
+
+          with open(service_file, "r", encoding="utf-8") as handle:
+              lines = [line.strip() for line in handle if line.strip()]
+
+          if not lines or not lines[0].startswith("#!"):
+              print("Invalid file format: First line must start with #!IMAGE_ID", file=sys.stderr)
+              sys.exit(1)
+
+          image_id = lines[0].lstrip("#!").strip()
+
+          deps = []
+          repo_url = ""
+          git_branch = ""
+
+          for line in lines:
+              if line.startswith("#"):
+                  continue
+
+              val = line.strip()
+              match = re.match(r"git://([^/]+)//(.+)", val)
+              if match:
+                  tag = match.group(1)
+                  url_full = match.group(2)
+                  if not repo_url:
+                      repo_url = url_full.split("#")[0] if "#" in url_full else url_full
+                      git_branch = tag
+                  if "#" in url_full:
+                      base, frag = url_full.split("#", 1)
+                      deps.append(f"git+{base}@{tag}#{frag}")
+                  else:
+                      deps.append(f"git+{url_full}@{tag}")
+              elif val:
+                  deps.append(val)
+
+          with open("adapters.requirements.txt", "w", encoding="utf-8") as handle:
+              handle.write("\n".join(deps))
+              if deps:
+                  handle.write("\n")
+
+          try:
+              commit_hash = subprocess.check_output(
+                  ["git", "--no-pager", "log", "-1", "--pretty=format:%H"]
+              ).decode("utf-8").strip()
+          except Exception:
+              commit_hash = "unknown"
+
+          created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          vendor = image_id.split("/")[0] if "/" in image_id else "unknown"
+          try:
+              title = image_id.split("/")[1].split(":")[0]
+          except Exception:
+              title = image_id
+          version = image_id.split(":")[-1] if ":" in image_id else "latest"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"image={image_id}\n")
+              handle.write(f"dockerfile={dockerfile}\n")
+              handle.write("context=.\n")
+              handle.write(f"created={created}\n")
+              handle.write(f"commit={commit_hash}\n")
+              handle.write(f"vendor={vendor}\n")
+              handle.write(f"title={title}\n")
+              handle.write(f"version={version}\n")
+              handle.write(f"repo_url={repo_url}\n")
+              handle.write(f"git_branch={git_branch}\n")
+
+      - name: Build and push - ${{ matrix.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.read.outputs.context }}
+          file: ${{ steps.read.outputs.dockerfile }}
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.read.outputs.image }}
+          build-args: |
+            REPO_URL=${{ steps.read.outputs.repo_url }}
+            GIT_BRANCH=${{ steps.read.outputs.git_branch }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.read.outputs.created }}
+            org.opencontainers.image.authors=${{ github.repository_owner }}
+            org.opencontainers.image.source=${{ github.repository }}@${{ steps.read.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.read.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.read.outputs.commit }}
+            org.opencontainers.image.vendor=${{ steps.read.outputs.vendor }}
+            org.opencontainers.image.title=${{ steps.read.outputs.title }}
+            org.opencontainers.image.description=OpenG2P IAM service image
+            org.openg2p.service.name=${{ matrix.name }}
